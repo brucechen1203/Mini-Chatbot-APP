@@ -31,6 +31,10 @@ class ChatRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     message: str = Field(..., min_length=1, max_length=1000, strip_whitespace=True)
 
+class ChatResponse(BaseModel):
+    response: str
+    turn_count: int
+
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Mini-Chatbot API!"}
@@ -53,7 +57,7 @@ def create_session():
     
     return {"session_id": session_id}
 
-@app.post("/chat")
+@app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     """
     Handle multi-turn conversation.
@@ -79,8 +83,10 @@ def chat(request: ChatRequest):
             messages=conversation_history
         )
         
-        # Extract assistant response
+        # Extract assistant response text from SDK result
         assistant_message = response.choices[0].message.content
+        if not assistant_message:
+            raise HTTPException(status_code=500, detail="Model returned an empty response")
         
         # Append assistant response to history
         conversation_history.append({
@@ -88,8 +94,8 @@ def chat(request: ChatRequest):
             "content": assistant_message
         })
         
-        # Calculate turn count (exclude system message)
-        turn_count = len([msg for msg in conversation_history if msg["role"] != "system"]) // 2
+        # Count completed user turns.
+        turn_count = len([msg for msg in conversation_history if msg["role"] == "user"])
         
         print(f"Session {request.session_id} - Turn {turn_count}")
         print(f"User: {request.message}")
