@@ -2,12 +2,18 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 import os
+import uuid
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = FastAPI()
+
+# In-memory session storage
+# key = session_id (string UUID)
+# value = list of message objects
+sessions = {}
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
@@ -24,6 +30,22 @@ class PromptRequest(BaseModel):
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Mini-Chatbot API!"}
+
+@app.post("/session")
+def create_session():
+    """
+    Create a new chat session with unique ID.
+    Initializes empty conversation history.
+    """
+    # Generate unique session ID
+    session_id = str(uuid.uuid4())
+    
+    # Initialize empty conversation history
+    sessions[session_id] = []
+    
+    print(f"Created new session: {session_id}")
+    
+    return {"session_id": session_id}
 
 @app.post("/test")
 def test_prompt(request: PromptRequest):
