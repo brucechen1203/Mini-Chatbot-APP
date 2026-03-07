@@ -27,6 +27,10 @@ client = OpenAI(api_key=api_key)
 class PromptRequest(BaseModel):
     prompt: str = Field(..., min_length=1, strip_whitespace=True)
 
+class ChatRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    message: str = Field(..., min_length=1, max_length=1000, strip_whitespace=True)
+
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Mini-Chatbot API!"}
@@ -35,17 +39,72 @@ def read_root():
 def create_session():
     """
     Create a new chat session with unique ID.
-    Initializes empty conversation history.
+    Initializes conversation history with system prompt.
     """
     # Generate unique session ID
     session_id = str(uuid.uuid4())
     
-    # Initialize empty conversation history
-    sessions[session_id] = []
+    # Initialize conversation history with system prompt
+    sessions[session_id] = [
+        {"role": "system", "content": "You are a helpful CS teaching assistant. Give concise explanations."}
+    ]
     
     print(f"Created new session: {session_id}")
     
     return {"session_id": session_id}
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    """
+    Handle multi-turn conversation.
+    Maintains conversation history and sends full context to LLM.
+    """
+    # Validate session exists
+    if request.session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Retrieve conversation history
+    conversation_history = sessions[request.session_id]
+    
+    # Append user message to history
+    conversation_history.append({
+        "role": "user",
+        "content": request.message
+    })
+    
+    try:
+        # Send full conversation history to LLM
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=conversation_history
+        )
+        
+        # Extract assistant response
+        assistant_message = response.choices[0].message.content
+        
+        # Append assistant response to history
+        conversation_history.append({
+            "role": "assistant",
+            "content": assistant_message
+        })
+        
+        # Calculate turn count (exclude system message)
+        turn_count = len([msg for msg in conversation_history if msg["role"] != "system"]) // 2
+        
+        print(f"Session {request.session_id} - Turn {turn_count}")
+        print(f"User: {request.message}")
+        print(f"Assistant: {assistant_message}")
+        print("\n" + "="*50 + "\n")
+        
+        return {
+            "response": assistant_message,
+            "turn_count": turn_count
+        }
+    
+    except Exception as e:
+        # Log the error and return 500
+        print(f"Error processing chat request: {str(e)}")
+        raise HTTPException(status_code=500, detail="An error occurred while processing your request")
 
 @app.post("/test")
 def test_prompt(request: PromptRequest):
