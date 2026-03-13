@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field, StringConstraints
 import uvicorn
 import os
 import uuid
+import math
 from typing import Annotated, List
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -52,6 +53,15 @@ class IngestResponse(BaseModel):
     doc_id: str
     chunks_added: int
 
+class SearchResult(BaseModel):
+    chunk_id: str
+    score: float
+    text: str
+
+class SearchResponse(BaseModel):
+    query: str
+    results: List[SearchResult]
+
 def split_text_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
     """
     Split text into fixed-size chunks with overlap.
@@ -80,6 +90,30 @@ def split_text_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int
         start += step
 
     return result
+
+def cosine_similarity(vector_a: List[float], vector_b: List[float]) -> float:
+    """
+    Compute cosine similarity manually (no external numeric libraries).
+    """
+    if len(vector_a) != len(vector_b):
+        raise ValueError("Vectors must have the same length")
+
+    dot_product = 0.0
+    norm_a_sq = 0.0
+    norm_b_sq = 0.0
+
+    for a, b in zip(vector_a, vector_b):
+        dot_product += a * b
+        norm_a_sq += a * a
+        norm_b_sq += b * b
+
+    norm_a = math.sqrt(norm_a_sq)
+    norm_b = math.sqrt(norm_b_sq)
+
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+
+    return dot_product / (norm_a * norm_b)
 
 @app.get("/")
 def read_root():
@@ -150,6 +184,50 @@ def ingest_document(request: IngestRequest):
     except Exception as e:
         print(f"Error ingesting document: {str(e)}")
         raise HTTPException(status_code=500, detail="An error occurred while ingesting the document")
+
+@app.get("/search", response_model=SearchResponse)
+def search_chunks(query: str, k: int = 3):
+    """
+    Semantic search endpoint for debugging retrieval quality.
+    """
+    cleaned_query = query.strip()
+    if not cleaned_query:
+        raise HTTPException(status_code=400, detail="query must not be empty")
+    if k <= 0:
+        raise HTTPException(status_code=400, detail="k must be greater than 0")
+    if not chunks:
+        raise HTTPException(status_code=404, detail="No chunks available. Ingest documents first.")
+
+    try:
+        query_embedding_response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=cleaned_query
+        )
+        query_embedding = query_embedding_response.data[0].embedding
+
+        scored_chunks = []
+        for chunk in chunks:
+            score = cosine_similarity(query_embedding, chunk["embedding"])
+            scored_chunks.append(
+                {
+                    "chunk_id": chunk["chunk_id"],
+                    "score": score,
+                    "text": chunk["text"],
+                }
+            )
+
+        ranked_results = sorted(scored_chunks, key=lambda item: item["score"], reverse=True)
+        top_results = ranked_results[:k]
+
+        return {
+            "query": cleaned_query,
+            "results": top_results,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error processing search request: {str(e)}")
+        raise HTTPException(status_code=500, detail="An error occurred while processing your search request")
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
