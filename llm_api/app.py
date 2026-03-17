@@ -62,6 +62,20 @@ class SearchResponse(BaseModel):
     query: str
     results: List[SearchResult]
 
+class Citation(BaseModel):
+    chunk_id: str
+    score: float
+
+class QARequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
+    k: int = Field(default=4, ge=1)
+
+class QAResponse(BaseModel):
+    answer: str
+    citations: List[Citation]
+    turn_count: int
+
 def split_text_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
     """
     Split text into fixed-size chunks with overlap.
@@ -114,6 +128,30 @@ def cosine_similarity(vector_a: List[float], vector_b: List[float]) -> float:
         return 0.0
 
     return dot_product / (norm_a * norm_b)
+
+def retrieve_top_chunks(query: str, k: int) -> List[dict]:
+    """
+    Retrieve top-k chunks by cosine similarity.
+    """
+    query_embedding_response = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=query
+    )
+    query_embedding = query_embedding_response.data[0].embedding
+
+    scored_chunks = []
+    for chunk in chunks:
+        score = cosine_similarity(query_embedding, chunk["embedding"])
+        scored_chunks.append(
+            {
+                "chunk_id": chunk["chunk_id"],
+                "score": score,
+                "text": chunk["text"],
+            }
+        )
+
+    ranked_results = sorted(scored_chunks, key=lambda item: item["score"], reverse=True)
+    return ranked_results[:k]
 
 @app.get("/")
 def read_root():
@@ -199,25 +237,7 @@ def search_chunks(query: str, k: int = 3):
         raise HTTPException(status_code=404, detail="No chunks available. Ingest documents first.")
 
     try:
-        query_embedding_response = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=cleaned_query
-        )
-        query_embedding = query_embedding_response.data[0].embedding
-
-        scored_chunks = []
-        for chunk in chunks:
-            score = cosine_similarity(query_embedding, chunk["embedding"])
-            scored_chunks.append(
-                {
-                    "chunk_id": chunk["chunk_id"],
-                    "score": score,
-                    "text": chunk["text"],
-                }
-            )
-
-        ranked_results = sorted(scored_chunks, key=lambda item: item["score"], reverse=True)
-        top_results = ranked_results[:k]
+        top_results = retrieve_top_chunks(cleaned_query, k)
 
         return {
             "query": cleaned_query,
@@ -228,6 +248,67 @@ def search_chunks(query: str, k: int = 3):
     except Exception as e:
         print(f"Error processing search request: {str(e)}")
         raise HTTPException(status_code=500, detail="An error occurred while processing your search request")
+
+@app.post("/qa", response_model=QAResponse)
+def grounded_qa(request: QARequest):
+    """
+    Grounded QA endpoint.
+    Uses retrieved chunks as context and returns citations.
+    """
+    if request.session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not chunks:
+        raise HTTPException(status_code=404, detail="No chunks available. Ingest documents first.")
+
+    conversation_history = sessions[request.session_id]
+
+    try:
+        top_chunks = retrieve_top_chunks(request.question, request.k)
+        citations = [{"chunk_id": item["chunk_id"], "score": item["score"]} for item in top_chunks]
+
+        context_blocks = []
+        for item in top_chunks:
+            context_blocks.append(
+                f"[{item['chunk_id']}] (score={item['score']:.4f})\n{item['text']}"
+            )
+        context_text = "\n\n".join(context_blocks)
+
+        grounding_instruction = (
+            "Use only the context below to answer the question. "
+            "If the answer is not in the context, say you do not have enough information from the ingested documents. "
+            "When possible, mention chunk ids like [doc#1].\n\n"
+            f"Context:\n{context_text}"
+        )
+
+        # Keep session history in natural chat form while injecting grounding context at generation time.
+        conversation_history.append({"role": "user", "content": request.question})
+        model_messages = conversation_history[:-1] + [
+            {"role": "system", "content": grounding_instruction},
+            {"role": "user", "content": request.question},
+        ]
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=model_messages
+        )
+
+        answer = response.choices[0].message.content
+        if not answer:
+            raise HTTPException(status_code=500, detail="Model returned an empty response")
+
+        conversation_history.append({"role": "assistant", "content": answer})
+        turn_count = len([msg for msg in conversation_history if msg["role"] == "user"])
+
+        return {
+            "answer": answer,
+            "citations": citations,
+            "turn_count": turn_count,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error processing QA request: {str(e)}")
+        raise HTTPException(status_code=500, detail="An error occurred while processing your QA request")
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
