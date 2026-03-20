@@ -4,6 +4,10 @@ import uvicorn
 import os
 import uuid
 import math
+import ast
+import operator
+import json
+import re
 from typing import Annotated, List
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -75,6 +79,20 @@ class QAResponse(BaseModel):
     answer: str
     citations: List[Citation]
     turn_count: int
+
+class AgentRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
+    k: int = Field(default=4, ge=1)
+
+class AgentStep(BaseModel):
+    action: str
+    input: str
+    output: str
+
+class AgentResponse(BaseModel):
+    answer: str
+    steps: List[AgentStep]
 
 def split_text_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
     """
@@ -152,6 +170,163 @@ def retrieve_top_chunks(query: str, k: int) -> List[dict]:
 
     ranked_results = sorted(scored_chunks, key=lambda item: item["score"], reverse=True)
     return ranked_results[:k]
+
+ALLOWED_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+ALLOWED_UNARY_OPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+def _eval_arithmetic_ast(node: ast.AST) -> float:
+    if isinstance(node, ast.Expression):
+        return _eval_arithmetic_ast(node.body)
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+
+    if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_BIN_OPS:
+        left_value = _eval_arithmetic_ast(node.left)
+        right_value = _eval_arithmetic_ast(node.right)
+        if isinstance(node.op, ast.Div) and right_value == 0:
+            raise ValueError("Division by zero is not allowed")
+        return ALLOWED_BIN_OPS[type(node.op)](left_value, right_value)
+
+    if isinstance(node, ast.UnaryOp) and type(node.op) in ALLOWED_UNARY_OPS:
+        return ALLOWED_UNARY_OPS[type(node.op)](_eval_arithmetic_ast(node.operand))
+
+    raise ValueError("Expression contains unsupported operations")
+
+def safe_calculator(expression: str) -> str:
+    cleaned_expression = expression.strip()
+    if not cleaned_expression:
+        raise ValueError("Expression must not be empty")
+
+    if len(cleaned_expression) > 120:
+        raise ValueError("Expression too long")
+
+    if not re.fullmatch(r"[0-9\s\+\-\*/\(\)\.]+", cleaned_expression):
+        raise ValueError("Expression contains invalid characters")
+
+    parsed = ast.parse(cleaned_expression, mode="eval")
+    result = _eval_arithmetic_ast(parsed)
+
+    if result.is_integer():
+        return str(int(result))
+    return str(result)
+
+def calculator_tool(tool_input: str) -> str:
+    return safe_calculator(tool_input)
+
+def knowledge_base_tool(tool_input: str, k: int) -> str:
+    if not chunks:
+        return "No chunks available. Ingest documents first."
+
+    results = retrieve_top_chunks(tool_input, k)
+    if not results:
+        return "No relevant chunks found."
+
+    lines = []
+    for item in results:
+        lines.append(f"[{item['chunk_id']}] score={item['score']:.4f} :: {item['text']}")
+    return "\n".join(lines)
+
+def parse_json_object(raw_text: str) -> dict:
+    text = raw_text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in model output")
+    return json.loads(match.group(0))
+
+def fallback_agent_decision(query: str, steps: List[dict]) -> dict:
+    lowered_query = query.lower()
+    used_actions = {step["action"] for step in steps}
+    has_math = bool(re.search(r"\d+\s*[\+\-\*/]\s*\d+", query))
+    knowledge_keywords = ["explain", "what is", "define", "why", "how", "recursion", "algorithm"]
+    has_knowledge_signal = any(keyword in lowered_query for keyword in knowledge_keywords)
+
+    if has_math and "calculator" not in used_actions:
+        expression_match = re.search(r"[\d\s\+\-\*/\(\)\.]+", query)
+        expression = expression_match.group(0).strip() if expression_match else query
+        return {"action": "calculator", "input": expression}
+
+    if has_knowledge_signal and "knowledge_base" not in used_actions:
+        return {"action": "knowledge_base", "input": query}
+
+    return {"action": "final", "input": "Provide final answer"}
+
+def agent_decide_action(query: str, steps: List[dict]) -> dict:
+    decision_system_prompt = (
+        "You are an agent controller for tool use. "
+        "You must return exactly one JSON object with keys: action and input. "
+        "Allowed actions: calculator, knowledge_base, final. "
+        "Choose calculator for arithmetic expressions. "
+        "Choose knowledge_base for factual/conceptual questions that require retrieval. "
+        "Choose final only when enough information is available to answer."
+    )
+
+    decision_user_prompt = (
+        f"User query: {query}\n"
+        f"Current steps: {json.dumps(steps, ensure_ascii=True)}\n"
+        "Return JSON only. Example: {\"action\":\"calculator\",\"input\":\"25*48\"}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": decision_system_prompt},
+                {"role": "user", "content": decision_user_prompt},
+            ],
+        )
+        content = response.choices[0].message.content or ""
+        decision = parse_json_object(content)
+
+        action = decision.get("action")
+        tool_input = decision.get("input", "")
+        if action not in {"calculator", "knowledge_base", "final"}:
+            raise ValueError("Invalid action")
+        if not isinstance(tool_input, str):
+            raise ValueError("input must be a string")
+
+        return {"action": action, "input": tool_input.strip()}
+    except Exception:
+        return fallback_agent_decision(query, steps)
+
+def agent_generate_final_answer(query: str, steps: List[dict]) -> str:
+    synthesis_prompt = (
+        "You are a helpful CS teaching assistant. "
+        "Synthesize a final answer using the available step outputs. "
+        "If a step output says information is missing, explicitly mention the limitation."
+    )
+
+    user_prompt = (
+        f"Query: {query}\n"
+        f"Tool steps:\n{json.dumps(steps, ensure_ascii=True, indent=2)}\n"
+        "Provide a concise final answer."
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": synthesis_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    answer = response.choices[0].message.content
+    if not answer:
+        raise ValueError("Model returned empty final answer")
+    return answer
 
 @app.get("/")
 def read_root():
@@ -364,6 +539,66 @@ def chat(request: ChatRequest):
         # Log the error and return 500
         print(f"Error processing chat request: {str(e)}")
         raise HTTPException(status_code=500, detail="An error occurred while processing your request")
+
+@app.post("/agent", response_model=AgentResponse)
+def run_agent(request: AgentRequest):
+    """
+    LLM agent endpoint with tool use.
+    Loop: decide -> act -> observe until final answer is produced.
+    """
+    if request.session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    conversation_history = sessions[request.session_id]
+    conversation_history.append({"role": "user", "content": request.query})
+
+    steps: List[dict] = []
+    max_steps = 6
+
+    try:
+        for _ in range(max_steps):
+            decision = agent_decide_action(request.query, steps)
+            action = decision["action"]
+            tool_input = decision.get("input", "")
+
+            if action == "final":
+                final_answer = agent_generate_final_answer(request.query, steps)
+                conversation_history.append({"role": "assistant", "content": final_answer})
+                print(f"Agent session={request.session_id} completed with {len(steps)} step(s)")
+                return {
+                    "answer": final_answer,
+                    "steps": steps,
+                }
+
+            if action == "calculator":
+                try:
+                    tool_output = calculator_tool(tool_input)
+                except Exception as e:
+                    tool_output = f"Calculator error: {str(e)}"
+            elif action == "knowledge_base":
+                tool_output = knowledge_base_tool(tool_input or request.query, request.k)
+            else:
+                tool_output = "Unsupported action"
+
+            step = {
+                "action": action,
+                "input": tool_input,
+                "output": tool_output,
+            }
+            steps.append(step)
+            print(f"Agent step: {step}")
+
+        final_answer = agent_generate_final_answer(request.query, steps)
+        conversation_history.append({"role": "assistant", "content": final_answer})
+        return {
+            "answer": final_answer,
+            "steps": steps,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error processing agent request: {str(e)}")
+        raise HTTPException(status_code=500, detail="An error occurred while processing your agent request")
 
 @app.post("/test")
 def test_prompt(request: PromptRequest):
