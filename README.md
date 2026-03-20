@@ -33,3 +33,20 @@ Common failure modes include poor chunking, weak retrieval recall, and prompt le
 
 ### 11. Why are citations important in AI systems?
 Citations provide transparency by showing which evidence supports an answer. They improve trust, make outputs auditable, and help users quickly verify or challenge claims. Citations are also useful for debugging retrieval quality, because developers can inspect whether the right chunks were selected. In educational and professional settings, citations are essential for accountability and responsible AI use.
+
+## Assignment 4 Reflection Questions (LLM Agent with Tool Use)
+
+### 7. What is an LLM agent?
+An LLM agent is a system where the model does more than generate one-shot text. It can decide whether a tool is needed, call that tool, observe the tool output, and then continue reasoning before producing a final answer. In this assignment, the agent behavior follows a loop: decide -> act -> observe.
+
+### 8. Why not always call tools?
+Tool calls increase latency, token usage, and implementation complexity. For simple requests, direct model responses are usually faster and sufficient, so calling tools every time is wasteful. Good agent design should call tools only when they improve correctness, such as exact arithmetic or retrieval-grounded knowledge.
+
+### 9. What are risks of tool misuse?
+Tool misuse can create security risks, incorrect outputs, and unstable behavior. For example, unsafe calculator execution can expose code injection risks, and wrong retrieval calls can introduce irrelevant context that harms answer quality. Excessive or incorrect tool calls also increase cost and can propagate errors through later reasoning steps.
+
+### 10. How does prompt design affect decisions?
+Prompt design strongly affects whether the agent chooses the right action. Clear instructions about available tools, when to use each tool, and strict output format constraints (for example, JSON action schemas) improve consistency. Ambiguous prompts often cause poor routing decisions, unnecessary tool calls, or premature final answers.
+
+### 11. What are limitations of this agent?
+This agent has several limitations. It only supports a small set of tools, so many tasks remain out of scope. Decision quality still depends on model reliability and prompt quality, and retrieval quality depends on chunking and embedding behavior. The in-memory session/chunk design is not persistent across restarts, and multi-step reasoning can still fail on ambiguous or complex queries.
